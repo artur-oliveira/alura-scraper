@@ -1,0 +1,5 @@
+*.m3u8
+*.pickle
+.env
+.idea/
+venv/
