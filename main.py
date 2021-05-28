@@ -1,9 +1,14 @@
+import os
 import pickle
+import shutil
+from concurrent.futures import ThreadPoolExecutor
+
 from decouple import config
 from json import JSONDecodeError
 from requests import Session
 from bs4 import BeautifulSoup
 from typing import List, Dict, Any
+from timeit import default_timer as timer
 
 CREDENTIALS: Dict = {
     'username': config('EMAIL'),
@@ -20,7 +25,16 @@ CATEGORIES: List[Dict] = [{'Cursos Mobile': 'mobile'},
 
 
 class AluraScraper(object):
+    """
+    Classe responsável por pegar todos os dados da Alura
+    """
     def __init__(self: 'AluraScraper', username: str, password: str, category: str) -> None:
+        """
+
+        :param username: Nome do usuário
+        :param password: Senha do usuário
+        :param category: Categoria escolhida via menu
+        """
         self.username: str = username
         self.password: str = password
 
@@ -34,6 +48,10 @@ class AluraScraper(object):
         self.course_data: List[Dict[str: str]] = []
 
     def login(self: 'AluraScraper') -> 'AluraScraper':
+        """
+        Realiza o login no site da alura, salva a sessão para que não precise ser feito o login novamente em algumas horas
+        :return:
+        """
         if self.file_exists('cookie.pickle'):
             self.browser.cookies = self.load_cookies()
             self.signed_in = True
@@ -45,6 +63,10 @@ class AluraScraper(object):
         return self
 
     def get_courses(self: 'AluraScraper') -> 'AluraScraper':
+        """
+        Pega todos os cursos disponíveis em uma determinada categoria
+        :return:
+        """
         assert self.is_logged()
 
         soup: BeautifulSoup = BeautifulSoup(self.browser.get(self.CATEGORY_URL).content, 'lxml')
@@ -64,11 +86,61 @@ class AluraScraper(object):
         return self
 
     def download_videos_course(self: 'AluraScraper', course: str) -> None:
+        """
+        Faz o download de todos os vídeos de um determinado curso
+        :param course: URL do curso que vai ser baixado
+        :return:
+        """
+        name: str = course.split('/')[2]
         data: dict = self.__download_m3u8_playlists(self.__get_download_links(course))
 
+        self.create_folder(name)
+
+        tasks_ts_files: List[tuple] = []
+        task_merge_files: List[tuple] = []
+
         for key in data.keys():
+            video_folder: str = name + '/' + key
+            task_merge_files.append((video_folder, ))
+
+            self.create_folder(video_folder)
             for i in range(len(data.get(key))):
-                self.download(data.get(key)[i], '%d-%d.ts' % (key, i))
+                tasks_ts_files.append((data.get(key)[i], '%s/%s-%d.ts' % (video_folder, key, i)))
+
+        start = timer()
+        print('COMEÇANDO O DOWNLOAD: %d PARTES ENCONTRADAS' % len(tasks_ts_files))
+        self.execute_in_thread(tasks_ts_files, self.__download_ts_files)
+        print('DOWNLOAD FINALIZADO EM %.2f SEGUNDOS' % (timer() - start))
+
+        print('JUNTANDO TODOS OS VÍDEOS')
+        self.execute_in_thread(task_merge_files, self.__merge_ts_files)
+
+    def __download_ts_files(self: 'AluraScraper', task: List[tuple]) -> None:
+        """
+        Função que responsável para fazer o download dos arquivos TS (partes dos vídeos)
+        :param task: Lista com tuplas que contém: O link, o nome do arquivo
+        :return:
+        """
+        link, filename = task
+        self.download(link, filename)
+
+    def __merge_ts_files(self: 'AluraScraper', task: tuple) -> None:
+        folder = task[0]
+        onlyfiles = [f for f in os.listdir(folder) if f.endswith('.ts')]
+
+        self.merge(folder, onlyfiles)
+
+    @staticmethod
+    def execute_in_thread(tasks: List[tuple], function, workers=8):
+        """
+        Função que executa uma função em multithreading
+        :param tasks: Lista de tuplas
+        :param function: função a ser executada
+        :param workers: é como se fosse o número de threads 8 é suficiente, acima disso é praticamente perca de tempo
+        :return:
+        """
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            pool.map(function, tasks)
 
     def __get_download_links(self: 'AluraScraper', course: str) -> List[str]:
         path: str = self.BASE_URL + course
@@ -91,26 +163,57 @@ class AluraScraper(object):
 
         return data
 
-    def __download_m3u8_playlists(self, list_links: List[str]) -> dict:
-        filename: str = 'index.m3u8'
+    def __download_m3u8_playlists(self: 'AluraScraper', list_links: List[str]) -> dict:
+        filename: str = 'index-%s.m3u8'
         list_links_return: dict = {}
         count: int = 1
+        tasks: List[tuple] = []
+
         for link in list_links:
-            self.download(link, filename)
-
-            with open(filename, 'r') as playlist:
-                list_links_return[count] = ['https://video.alura.com.br' + line.strip() for line in playlist
-                                            if line.strip().startswith('/hls/alura/')]
-
+            tasks.append((link, filename % str(count), list_links_return))
             count += 1
+
+        self.execute_in_thread(tasks, self.__download_m3u8)
+
+        while len(tasks) > 0:
+            tasks: List[tuple] = []
+            for key in list_links_return.keys():
+                if len(list_links_return.get(key)) == 0:
+                    tasks.append((list_links[int(key) - 1], filename % key, list_links_return))
+
+            self.execute_in_thread(tasks, self.__download_m3u8)
 
         return list_links_return
 
-    def download(self, link, filename):
+    def __download_m3u8(self, task: list) -> None:
+        link, filename, list_links_return = task
+
+        self.download(link, filename)
+
+        with open(filename, 'r') as playlist:
+            data = ['https://video.alura.com.br' + line.strip() for
+                    line in playlist
+                    if line.strip().startswith('/hls/alura/')]
+
+        list_links_return[filename.split('-')[1].split('.')[0]] = data
+        os.remove(filename)
+
+    def download(self: 'AluraScraper', link: str, filename: str) -> None:
         with self.browser.get(link) as res:
             with open(filename, 'wb') as f:
-                for chunk in res.iter_content(chunk_size=8192):
+                for chunk in res.iter_content(chunk_size=1024):
                     f.write(chunk)
+
+    @staticmethod
+    def merge(folder: str, data: List[str]) -> None:
+        filename: str = folder.split('/')[0] + '/' + data[0].split('-')[0] + '.mp4'
+
+        with open(filename, 'ab') as final:
+            for item in data:
+                with open(folder + '/' + item, 'rb') as temp:
+                    final.write(temp.read())
+
+        shutil.rmtree(folder)
 
     def is_logged(self: 'AluraScraper') -> bool:
         return self.signed_in
@@ -142,6 +245,14 @@ class AluraScraper(object):
             return True
         except FileNotFoundError:
             return False
+
+    @staticmethod
+    def create_folder(folder: str) -> None:
+        try:
+            os.makedirs(folder)
+            print('A PASTA %s FOI CRIADA' % folder)
+        except FileExistsError:
+            print('A PASTA %s JÁ EXISTE' % folder)
 
 
 class Menu:
