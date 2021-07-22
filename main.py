@@ -261,7 +261,8 @@ class Menu:
 
     def show_menu(self: 'Menu') -> None:
         course = self.__choose_course()
-        self.scraper.download_videos_course(course)
+        for item in course:
+            self.scraper.download_videos_course(item)
 
     def __choose_category(self: 'Menu') -> List[Dict]:
         self.scraper = AluraScraper(CREDENTIALS.get('username'),
@@ -272,8 +273,9 @@ class Menu:
     def __choose_subcategory(self: 'Menu') -> List[Dict]:
         return self.__choose_valid_option_or_exit(self.__choose_category())
 
-    def __choose_course(self: 'Menu') -> str:
-        return self.__choose_valid_option_or_exit(self.__choose_subcategory())
+    def __choose_course(self: 'Menu') -> List[str]:
+        data = self.__choose_subcategory()
+        return [list(data[i].values())[0] for i in range(len(data))]
 
     @staticmethod
     def __choose_valid_option_or_exit(data: List[Dict]) -> Any:
